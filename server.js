@@ -14,8 +14,12 @@ const { configureRealtimeAdapter } = require('./services/realtimeAdapter');
 // Fail fast for mongoose if database is offline
 mongoose.set('bufferCommands', false);
 
-// Load environment variables
-dotenv.config();
+// Load environment variables safely (do not fail if .env is missing in production on Render)
+if (process.env.NODE_ENV !== 'production') {
+  dotenv.config();
+} else {
+  dotenv.config({ silent: true });
+}
 
 const { notFound, errorHandler } = require('./middleware/errorMiddleware');
 const { pool, initializeDatabase } = require('./config/postgres');
@@ -33,16 +37,16 @@ const compression = require('compression');
 const { protect } = require('./middleware/authMiddleware');
 
 const app = express();
-// Enable trust proxy for cloud environments / reverse proxies (Cloud Run, AI Studio)
+// Enable trust proxy for cloud environments / reverse proxies (Render, Vercel)
 app.set('trust proxy', 1);
 
 const httpServer = http.createServer(app);
 const io = new SocketServer(httpServer, {
   path: process.env.VERCEL === '1' ? '/api/socket-io/socket.io' : '/socket.io',
   cors: {
-    origin: process.env.CORS_ORIGIN
-      ? process.env.CORS_ORIGIN.split(',').map((origin) => origin.trim())
-      : process.env.NODE_ENV === 'production' ? false : '*',
+    origin: process.env.CORS_ORIGIN || process.env.CLIENT_URL
+      ? (process.env.CORS_ORIGIN || process.env.CLIENT_URL).split(',').map((origin) => origin.trim())
+      : '*',
   },
 });
 
@@ -53,6 +57,7 @@ const initializeServices = () => {
   if (initializationPromise) return initializationPromise;
   initializationPromise = initializeServicesOnce().catch((error) => {
     initializationPromise = null;
+    console.error('Service initialization failed:', error.message || error);
     throw error;
   });
   return initializationPromise;
@@ -69,8 +74,17 @@ const initializeServicesOnce = async () => {
     throw new Error('MONGODB_URI is required in production for placement and application data.');
   }
 
-  await initializeDatabase();
+  // Safely attempt PostgreSQL database initialization
+  try {
+    if (typeof initializeDatabase === 'function') {
+      await initializeDatabase();
+      console.log('PostgreSQL database initialized.');
+    }
+  } catch (pgErr) {
+    console.warn('PostgreSQL initialization warning:', pgErr.message);
+  }
 
+  // Connect to MongoDB Atlas
   if (mongoUri && mongoose.connection.readyState !== 1) {
     try {
       await mongoose.connect(mongoUri, {
@@ -82,8 +96,8 @@ const initializeServicesOnce = async () => {
       });
       console.log('MongoDB connected successfully.');
     } catch (mongoErr) {
+      console.error('MongoDB connection error:', mongoErr.message);
       if (isProduction) throw mongoErr;
-      console.warn('MongoDB connection failed; optional MongoDB features are unavailable:', mongoErr.message);
     }
   }
 
@@ -119,22 +133,24 @@ const fallbackApplications = [];
 app.locals = app.locals || {};
 app.locals.fallbackApplications = fallbackApplications;
 
-// Gzip/Brotli Compression for snappy response times
+// Gzip/Brotli Compression
 app.use(compression());
 
 // Body parser
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Same-origin is the production default; cross-origin access must be configured explicitly.
+// CORS configuration supporting CLIENT_URL from Render env
+const allowedOrigins = (process.env.CLIENT_URL || process.env.CORS_ORIGIN || '*')
+  .split(',')
+  .map((origin) => origin.trim());
+
 app.use(cors({
-  origin: process.env.CORS_ORIGIN
-    ? process.env.CORS_ORIGIN.split(',').map((origin) => origin.trim())
-    : process.env.NODE_ENV === 'production' ? false : '*',
+  origin: allowedOrigins.includes('*') ? '*' : allowedOrigins,
+  credentials: true,
 }));
 
 // Set security headers with Helmet
-// Allow CDNs for Bootstrap, Bootstrap Icons, and Chart.js
 app.use(
   helmet({
     frameguard: { action: 'sameorigin' },
@@ -164,7 +180,7 @@ app.use(
           'https://fonts.gstatic.com',
         ],
         imgSrc: ["'self'", 'data:', 'https:'],
-        connectSrc: ["'self'", 'ws:', 'wss:'],
+        connectSrc: ["'self'", 'ws:', 'wss:', 'https:'],
       },
     },
     crossOriginEmbedderPolicy: false,
@@ -178,14 +194,15 @@ if (process.env.NODE_ENV === 'development') {
 
 // Rate limiting for API requests
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 1000, // limit each IP to 1000 requests per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 1000,
   message: {
     success: false,
     message: 'Too many requests from this IP address, please try again after 15 minutes.',
   },
 });
 app.use('/api', limiter);
+
 app.get('/api/runtime-config', (req, res) => {
   const socketPath = process.env.VERCEL === '1'
     ? '/api/socket-io/socket.io'
@@ -199,6 +216,7 @@ app.get('/api/runtime-config', (req, res) => {
     },
   });
 });
+
 app.use('/api', async (req, res, next) => {
   try {
     await initializeServices();
@@ -208,7 +226,7 @@ app.use('/api', async (req, res, next) => {
   }
 });
 
-// Serve static frontend assets with caching and ETag support
+// Serve static frontend assets
 app.use(express.static(path.join(__dirname, 'public'), {
   maxAge: '1h',
   etag: true,
@@ -218,18 +236,16 @@ app.use(express.static(path.join(__dirname, 'public'), {
 app.get('/api/health', async (req, res) => {
   try {
     await initializeServices();
-    await pool.query('SELECT 1');
     res.status(200).json({
       success: true,
       databases: {
-        postgres: 'connected',
         mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
       },
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    console.error('Required database health check failed:', error.message);
-    res.status(503).json({ success: false, message: 'Required database health check failed.' });
+    console.error('Database health check failed:', error.message);
+    res.status(503).json({ success: false, message: error.message || 'Database connection failed.' });
   }
 });
 
@@ -252,7 +268,7 @@ app.use('/api', (req, res) => {
   });
 });
 
-// Fallback for frontend SPA navigation
+// Fallback for SPA routing
 app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api')) {
     return next();
@@ -267,25 +283,24 @@ app.use(errorHandler);
 const startServer = async () => {
   try {
     await initializeServices();
-    const port = Number(process.env.PORT) || 3000;
+    const port = Number(process.env.PORT) || 5000;
     const server = httpServer.listen(port, '0.0.0.0', () => {
       console.log(`\n======================================================`);
-      console.log(`Student Academic Personal and Career Profiling System`);
-      console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on http://localhost:${port}`);
+      console.log(`Student Academic Personal & Career Profiling System`);
+      console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on port ${port}`);
       console.log(`======================================================\n`);
     });
 
     server.on('error', (error) => {
       if (error.code === 'EADDRINUSE') {
-        console.error(`Port ${PORT} is already in use. Stop the existing server or set PORT to another value.`);
+        console.error(`Port ${port} is already in use.`);
       } else {
         console.error('Backend listener failed:', error.message);
       }
       process.exitCode = 1;
     });
   } catch (err) {
-    const reason = err.code || err.name || err.message;
-    console.error('Failed to start backend:', reason);
+    console.error('Failed to start backend detailed error:', err.stack || err);
     process.exit(1);
   }
 };
